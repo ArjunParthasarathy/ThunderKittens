@@ -2,8 +2,8 @@
 #include "kittens.cuh"
 #include "prototype.cuh"
 
-#define NUM_WORKERS 1
-#define NUM_WARPS 1
+#define NUM_WORKERS 4
+#define NUM_WARPS (NUM_WORKERS)
 #define NUM_THREADS (NUM_WARPS * kittens::WARP_THREADS)
 
 // shared patterns
@@ -18,10 +18,6 @@ template<int n1> struct fftconv_layout {
     using seq_layout = gl<bf16, -1, -1, n1, n1>;
     using filter_layout = cgl<gl<bf16, 1, -1, 64, 64>>;
     using fft_layout = cgl<gl<bf16, 1, 1, 64, 64>>;
-
-    // using complex_input_layout = kittens::cgl<input_layout>;
-    // using complex_filter_layout = kittens::cgl<filter_layout>;
-    // using complex_fft_layout = kittens::cgl<fft_layout>;
     
     struct globals { 
         seq_layout u_g;
@@ -54,7 +50,9 @@ __global__ void fftconv_tk(typename T::layout::globals g, int B_TILE, int H_TILE
     //     rows = 1;
     // }
 
-    int b_start = blockIdx.x * B_TILE;
+    int h_start = blockIdx.x * H_TILE;
+
+    using workers = group<NUM_WORKERS>;
 
     // Registers; everyone loads
     rt_cmplx_bf_base a_reg;       
@@ -62,13 +60,30 @@ __global__ void fftconv_tk(typename T::layout::globals g, int B_TILE, int H_TILE
     rt_cmplx_bf_base accum;       
     rt_cmplx_bf_base_col b_reg;
 
+    rt_cmplx_bf_base f_reg;
+    rt_cmplx_bf_base_col f_reg_col;
+
+    rt_cmplx_bf_base finv_reg;
+    rt_cmplx_bf_base f_reg;
+    rt_cmplx_bf_base f_reg;
+
+
     zero(a_reg);
     zero(mma_reg);
     zero(accum);
     zero(b_reg);
 
-    for (int i = 0; i < H_TILE; i++) {
-        for (int j = b_start; j < b_start+B_TILE; j++) {   
+    workers::load(f_reg,       g.f,       {0, 0, 0, 0});
+    workers::load(finv_reg,    g.finv,    {0, 0, 0, 0});
+    workers::load(tw_reg,      g.tw,      {0, 0, 0, 0});
+    workers::load(tw_t_reg, g.twinv_t, {0, 0, 0, 0});
+
+    
+    // All batches handled by single block - heads split across
+    for (int curr_head = h_start; curr_head < H_TILE; curr_head++) {
+        workers.sync(3);
+        workers.load();
+        for (int b = 0; j < b_start+B_TILE; j++) {   
             // In code we load in by quadrants of the batches
             // For each outer batch, we load in the inner batches, and then do the computation of 
             int diff = j - b_start;
@@ -85,14 +100,14 @@ __global__ void fftconv_tk(typename T::layout::globals g, int B_TILE, int H_TILE
             load(a_reg, g.tw_g, {0, 0, 0, 0});// needs to be imag too.
             kittens::mul(accum, accum, a_reg);
 
-            // // X = XF
-            load(b_reg, g.f_g, {0, 0, 0, 0}); // needs to be imag too.
+            swap_layout(f_reg_col, f_reg);
+            // X = XF
             kittens::zero(mma_reg);
             kittens::mma_AB(mma_reg, accum, b_reg, mma_reg);
             kittens::copy(accum, mma_reg);
 
             // X = X * K_f^T
-            load(a_reg, g.kf_g, {0, i, 0, 0});
+            load(a_reg, g.kf_g, {0, curr_head, 0, 0});
             kittens::mul(accum, accum, a_reg);
 
             // X = XFinv
@@ -194,10 +209,9 @@ void launch(typename fft_template<SEQ>::layout::globals G, int B, int H) {
     static int h_tiles = H;
 
 
-    long mem_size = 1000;
-
+    unsigned long mem_size = (MAX_SHARED_MEMORY-1024);
     cudaFuncSetAttribute(
-        fftconv_tk<fftst>,
+        prototype::lcsf::kernel<fftst>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
     );
